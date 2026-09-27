@@ -862,10 +862,14 @@ class MLXModelWrapper:
         """
         Save model in GGUF format for llama.cpp, Ollama, LM Studio, etc.
 
-        Fuses saved LoRA adapters (if any), dequantizes, converts with llama.cpp's
+        Fuses the in-memory LoRA layers (if any), dequantizes, converts with llama.cpp's
         ``convert_hf_to_gguf.py`` and quantizes with ``llama-quantize``. Works with
         quantized (4-bit/8-bit) bases and any architecture llama.cpp supports.
         Requires llama.cpp; see :func:`mlx_tune.trainer.export_to_gguf`.
+
+        Like ``save_pretrained_merged``, this fuses the LoRA layers into the
+        in-memory model; save adapters first (``save_pretrained``) if you want to
+        keep training afterwards.
 
         Args:
             output_dir: Directory (``model.gguf`` is written inside) or ``.gguf`` path
@@ -901,40 +905,24 @@ class MLXModelWrapper:
                 "to track the original model path."
             )
 
-        # Check for adapter path if LoRA was applied
-        adapter_path = None
         if self._lora_applied:
-            if self._adapter_path:
-                adapter_path = str(self._adapter_path)
-            else:
-                # Check common adapter locations
-                common_paths = [
-                    Path("./adapters"),
-                    Path("./lora_finetuned/adapters"),
-                    Path("./outputs/adapters"),
-                ]
-                for path in common_paths:
-                    if (path / "adapters.safetensors").exists():
-                        adapter_path = str(path)
-                        break
-
-            if adapter_path:
-                print(f"  LoRA adapters will be fused from: {adapter_path}")
-            else:
-                print("  Warning: LoRA was applied but no adapter path found.")
-                print("  Export will use base model only. Train and save adapters first.")
+            print("  LoRA layers will be fused from the in-memory model")
 
         if isinstance(self.config, dict) and self.config.get("quantization"):
             bits = self.config["quantization"].get("bits", "?")
             print(f"  Quantized base detected ({bits}-bit): weights will be "
                   "dequantized to full precision before GGUF conversion.")
 
+        # Merge the model that is already in memory (with its trained LoRA)
+        # rather than reloading the base from disk: avoids holding two copies
+        # of the weights, and exports exactly what was trained.
         print(f"Exporting to GGUF format...")
         return export_to_gguf(
-            model_path,  # Use original model path, not output directory
+            model_path,  # original model path (tokenizer assets are read from here)
             output_path=str(output_path),
             quantization=quantization_method,
-            adapter_path=adapter_path,
+            model=self,
+            tokenizer=tokenizer if tokenizer is not None else self.tokenizer,
             **kwargs
         )
 

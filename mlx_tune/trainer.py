@@ -437,11 +437,40 @@ def _find_llama_cpp(llama_cpp_path: Optional[str] = None) -> Dict[str, Optional[
     return {"convert_script": convert_script, "quantize_bin": quantize_bin}
 
 
-def _merge_for_gguf(model_path: Union[str, Path], adapter_path: Optional[str], out_dir: Path) -> Path:
-    """Load base (+ adapters), fuse, dequantize, and save full-precision HF weights."""
+def _copy_tokenizer_assets(model_path: Union[str, Path], out_dir: Path) -> None:
+    """Copy tokenizer files HF tokenizers don't re-emit but llama.cpp may need.
+
+    Only files that exist in the *source* checkpoint are copied, so a model that
+    ships just ``tokenizer.json`` (e.g. Gemma 4) is converted from that.
+    """
     import shutil
+    from mlx_lm.utils import _download
+
+    src = Path(model_path) if Path(model_path).exists() else _download(str(model_path))
+    for name in ("tokenizer.model", "tokenizer.model.v3", "tekken.json"):
+        if (src / name).is_file() and not (out_dir / name).exists():
+            shutil.copy2(src / name, out_dir / name)
+
+
+def _release_mlx_memory() -> None:
+    import gc
+    gc.collect()
+    try:
+        import mlx.core as mx
+        mx.clear_cache()
+    except Exception:
+        pass
+
+
+def _merge_for_gguf(model_path: Union[str, Path], adapter_path: Optional[str], out_dir: Path) -> Path:
+    """Load base (+ adapters) from disk, fuse, dequantize, save full-precision HF weights.
+
+    Used by the standalone ``export_to_gguf(model_path, adapter_path=...)``. When a
+    model is already in memory, ``save_model_hf_format`` is used instead so the
+    weights are not loaded twice.
+    """
     from mlx_lm import load as mlx_load
-    from mlx_lm.utils import save_model, save_config, dequantize_model, _download
+    from mlx_lm.utils import save_model, save_config, dequantize_model
     from mlx.utils import tree_unflatten
 
     print(f"  Loading {model_path}" + (f" with adapters from {adapter_path}" if adapter_path else ""))
@@ -460,13 +489,8 @@ def _merge_for_gguf(model_path: Union[str, Path], adapter_path: Optional[str], o
     save_model(str(out_dir), model, donate_model=True)
     save_config(config, config_path=out_dir / "config.json")
     tokenizer.save_pretrained(str(out_dir))
-
-    # llama.cpp's converter needs the original SentencePiece model for some
-    # architectures (Gemma, Llama-2, Mistral); HF tokenizers don't re-emit it.
-    src = Path(model_path) if Path(model_path).exists() else _download(str(model_path))
-    for name in ("tokenizer.model", "tokenizer.model.v3", "tekken.json"):
-        if (src / name).is_file() and not (out_dir / name).exists():
-            shutil.copy2(src / name, out_dir / name)
+    del model
+    _copy_tokenizer_assets(model_path, out_dir)
     return out_dir
 
 
@@ -505,6 +529,10 @@ def export_to_gguf(
             - llama_cpp_python: Python used to run the converter (else
               ``$LLAMA_CPP_PYTHON``, else the current interpreter).
             - keep_intermediates: keep merged weights / f16 GGUF (default False).
+            - model / tokenizer: an in-memory (LoRA-applied) model to merge instead
+              of reloading ``model_path`` from disk; used by ``save_pretrained_gguf``
+              so the weights are only held once. The LoRA layers are fused into this
+              model in place (same as ``save_pretrained_merged``).
             - dequantize: accepted for backward compatibility (always dequantizes).
 
     Raises:
@@ -546,10 +574,18 @@ def export_to_gguf(
     print(f"  Quantization: {quant}" + (" (QAT)" if qat else ""))
     print(f"  Output: {output_path}")
 
+    in_memory_model = kwargs.get("model")
     work = Path(tempfile.mkdtemp(prefix="mlx_tune_gguf_", dir=str(output_path.parent)))
     try:
         print("[1/3] Fusing adapters and dequantizing to full precision...")
-        merged_dir = _merge_for_gguf(model_path, adapter_path, work / "merged")
+        if in_memory_model is not None:
+            merged_dir = work / "merged"
+            save_model_hf_format(in_memory_model, kwargs.get("tokenizer"), str(merged_dir),
+                                 save_method="merged_16bit")
+            _copy_tokenizer_assets(model_path, merged_dir)
+        else:
+            merged_dir = _merge_for_gguf(model_path, adapter_path, work / "merged")
+        _release_mlx_memory()
 
         converted = output_path if quant in _GGUF_UNQUANTIZED_TYPES else work / "model-f16.gguf"
         print(f"[2/3] Converting to GGUF ({'final ' + quant if converted == output_path else 'f16 intermediate'})...")

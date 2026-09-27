@@ -194,14 +194,14 @@ class TestExportToGGUF:
 # ---------------------------------------------------------------------------
 
 class TestSavePretrainedGGUFWiring:
-    def test_passes_quantization_adapter_and_kwargs(self, tmp_path):
+    def test_passes_in_memory_model_quantization_and_kwargs(self, tmp_path):
         from mlx_tune.model import MLXModelWrapper
 
-        wrapper = MLXModelWrapper(model=object(), tokenizer=None, max_seq_length=256,
+        tok = object()
+        wrapper = MLXModelWrapper(model=object(), tokenizer=tok, max_seq_length=256,
                                   model_name="mlx-community/gemma-2-2b-it-4bit",
                                   config={"model_type": "gemma2", "quantization": {"bits": 4}})
         wrapper._lora_applied = True
-        wrapper._adapter_path = tmp_path / "adapters"
 
         with mock.patch("mlx_tune.trainer.export_to_gguf", return_value="x.gguf") as m:
             ret = wrapper.save_pretrained_gguf(str(tmp_path / "out"), None,
@@ -211,5 +211,30 @@ class TestSavePretrainedGGUFWiring:
         assert args[0] == "mlx-community/gemma-2-2b-it-4bit"
         assert kwargs["output_path"] == str(tmp_path / "out" / "model.gguf")
         assert kwargs["quantization"] == "q4_0"
-        assert kwargs["adapter_path"] == str(tmp_path / "adapters")
         assert kwargs["qat"] is True
+        # merges the in-memory model instead of reloading base + adapters from disk
+        assert kwargs["model"] is wrapper
+        assert kwargs["tokenizer"] is tok  # falls back to the wrapper's tokenizer
+        assert "adapter_path" not in kwargs
+
+
+class TestExportInMemoryModel:
+    def test_in_memory_model_uses_save_model_hf_format(self, isolated_env, monkeypatch):
+        root = _fake_llama_cpp(isolated_env / "lc")
+        monkeypatch.setattr(subprocess, "run", _fake_run_factory([]))
+        seen = {}
+
+        def fake_hf_save(model, tokenizer, output_dir, save_method="merged_16bit", **kw):
+            seen.update(model=model, tokenizer=tokenizer, save_method=save_method)
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+            (Path(output_dir) / "config.json").write_text("{}")
+
+        monkeypatch.setattr(trainer, "save_model_hf_format", fake_hf_save)
+        monkeypatch.setattr(trainer, "_copy_tokenizer_assets", lambda *a, **k: None)
+        monkeypatch.setattr(trainer, "_merge_for_gguf",
+                            lambda *a, **k: pytest.fail("must not reload from disk"))
+
+        model, tok = object(), object()
+        export_to_gguf("base/model", output_path=str(isolated_env / "m.gguf"),
+                       llama_cpp_path=str(root), model=model, tokenizer=tok)
+        assert seen == {"model": model, "tokenizer": tok, "save_method": "merged_16bit"}
